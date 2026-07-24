@@ -30,6 +30,10 @@ RATE_LIMIT_WINDOW_SEC = 300
 RATE_LIMIT_MAX_FAILURES = 5
 SESSION_MAX_AGE_HOURS_DEFAULT = 24
 MIN_PASSWORD_LEN = 6
+# Native clients cannot rely on cookies; they exchange the admin password for
+# a bearer token with a longer lifetime (re-login on a phone is expensive).
+ACCESS_TOKEN_MAX_AGE_DAYS_DEFAULT = 30
+_ACCESS_TOKEN_MARKER = "t"
 
 # Lazy-loaded state
 _auth_enabled: Optional[bool] = None
@@ -363,6 +367,51 @@ def verify_session(value: str) -> bool:
     except ValueError:
         max_age_hours = SESSION_MAX_AGE_HOURS_DEFAULT
     if time.time() - ts > max_age_hours * 3600:
+        return False
+    return True
+
+
+def create_access_token() -> str:
+    """Create a signed bearer token for native clients.
+
+    Format: ``nonce.ts.t.signature`` — the extra ``t`` segment keeps tokens
+    and browser session cookies in separate namespaces even though both are
+    signed with the same secret, so a cookie can never be replayed as a
+    token (or vice versa) to gain the longer lifetime.
+    """
+    secret = _get_session_secret()
+    if not secret:
+        return ""
+    nonce = secrets.token_urlsafe(32)
+    ts = str(int(time.time()))
+    payload = f"{nonce}.{ts}.{_ACCESS_TOKEN_MARKER}"
+    sig = hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{payload}.{sig}"
+
+
+def verify_access_token(value: str) -> bool:
+    """Verify a bearer token issued by :func:`create_access_token`."""
+    secret = _get_session_secret()
+    if not secret or not value:
+        return False
+    parts = value.split(".")
+    if len(parts) != 4 or parts[2] != _ACCESS_TOKEN_MARKER:
+        return False
+    payload = f"{parts[0]}.{parts[1]}.{parts[2]}"
+    expected = hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(parts[3], expected):
+        return False
+    try:
+        ts = int(parts[1])
+    except ValueError:
+        return False
+    try:
+        max_age_days = int(
+            os.getenv("ADMIN_TOKEN_MAX_AGE_DAYS", str(ACCESS_TOKEN_MAX_AGE_DAYS_DEFAULT))
+        )
+    except ValueError:
+        max_age_days = ACCESS_TOKEN_MAX_AGE_DAYS_DEFAULT
+    if time.time() - ts > max_age_days * 86400:
         return False
     return True
 

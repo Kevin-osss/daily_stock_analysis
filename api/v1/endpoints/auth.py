@@ -12,11 +12,13 @@ from pydantic import BaseModel, Field
 
 from api.deps import get_system_config_service
 from src.auth import (
+    ACCESS_TOKEN_MAX_AGE_DAYS_DEFAULT,
     COOKIE_NAME,
     SESSION_MAX_AGE_HOURS_DEFAULT,
     change_password,
     check_rate_limit,
     clear_rate_limit,
+    create_access_token,
     create_session,
     get_client_ip,
     has_stored_password,
@@ -46,6 +48,12 @@ class LoginRequest(BaseModel):
 
     password: str = Field(default="", description="Admin password")
     password_confirm: str | None = Field(default=None, alias="passwordConfirm", description="Confirm (first-time)")
+
+
+class TokenRequest(BaseModel):
+    """Token request body for native clients."""
+
+    password: str = Field(default="", description="Admin password")
 
 
 class ChangePasswordRequest(BaseModel):
@@ -421,6 +429,83 @@ async def auth_login(request: Request, body: LoginRequest):
     resp = JSONResponse(content={"ok": True})
     _set_session_cookie(resp, session_val, request)
     return resp
+
+
+@router.post(
+    "/token",
+    summary="Issue a bearer token for native clients",
+    description=(
+        "Exchange the admin password for a bearer token. Mobile/desktop clients "
+        "send it as `Authorization: Bearer <token>`; browsers should keep using "
+        "/login with its session cookie. Requires an already-configured password "
+        "(unlike /login, this never performs first-time setup)."
+    ),
+)
+async def auth_issue_token(request: Request, body: TokenRequest):
+    """Verify the admin password and return a long-lived bearer token."""
+    if not is_auth_enabled():
+        return JSONResponse(
+            status_code=400,
+            content={"error": "auth_disabled", "message": "Authentication is not configured"},
+        )
+
+    password = (body.password or "").strip()
+    if not password:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "password_required", "message": "请输入密码"},
+        )
+
+    ip = get_client_ip(request)
+    if not check_rate_limit(ip):
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "rate_limited",
+                "message": "Too many failed attempts. Please try again later.",
+            },
+        )
+
+    # Initial password setup stays a browser-only flow, so an unauthenticated
+    # client can never bootstrap credentials through the token endpoint.
+    if not is_password_set():
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "password_not_set",
+                "message": "请先在 Web 端设置管理员密码",
+            },
+        )
+
+    if not verify_password(password):
+        record_login_failure(ip)
+        return JSONResponse(
+            status_code=401,
+            content={"error": "invalid_password", "message": "密码错误"},
+        )
+
+    clear_rate_limit(ip)
+    token = create_access_token()
+    if not token:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal_error", "message": "Failed to create token"},
+        )
+
+    try:
+        max_age_days = int(
+            os.getenv("ADMIN_TOKEN_MAX_AGE_DAYS", str(ACCESS_TOKEN_MAX_AGE_DAYS_DEFAULT))
+        )
+    except ValueError:
+        max_age_days = ACCESS_TOKEN_MAX_AGE_DAYS_DEFAULT
+
+    return JSONResponse(
+        content={
+            "token": token,
+            "token_type": "bearer",
+            "expires_in": max_age_days * 86400,
+        }
+    )
 
 
 @router.post(
