@@ -94,6 +94,16 @@ class YfinanceFetcher(BaseFetcher):
         """
         return is_suffix_market_symbol(stock_code, "tw")
 
+    @staticmethod
+    def _to_hk_yahoo_symbol(digits: str) -> str:
+        """港股数字代码 -> Yahoo Finance 的 <code>.HK 形式。
+
+        Yahoo 对港股使用去前导零后补齐 4 位的写法（如 00700 -> 0700.HK、
+        02513 -> 2513.HK）。带/不带 HK 前缀都复用此转换，避免两处逻辑漂移。
+        """
+        code = digits.lstrip('0') or '0'
+        return f"{code.zfill(4)}.HK"
+
     def _convert_stock_code(self, stock_code: str) -> str:
         """
         转换股票代码为 Yahoo Finance 格式
@@ -138,10 +148,9 @@ class YfinanceFetcher(BaseFetcher):
 
         # 港股：hk前缀 -> .HK后缀
         if code.startswith('HK'):
-            hk_code = code[2:].lstrip('0') or '0'  # 去除前导0，但保留至少一个0
-            hk_code = hk_code.zfill(4)  # 补齐到4位
-            logger.debug(f"转换港股代码: {stock_code} -> {hk_code}.HK")
-            return f"{hk_code}.HK"
+            hk_code = self._to_hk_yahoo_symbol(code[2:])
+            logger.debug(f"转换港股代码: {stock_code} -> {hk_code}")
+            return hk_code
 
         # 已经包含后缀的情况
         if '.SS' in code or '.SZ' in code or '.HK' in code or '.BJ' in code:
@@ -167,9 +176,17 @@ class YfinanceFetcher(BaseFetcher):
             return f"{code}.SS"
         elif code.startswith(('000', '002', '300')):
             return f"{code}.SZ"
-        else:
-            logger.warning(f"无法确定股票 {code} 的市场，默认使用深市")
-            return f"{code}.SZ"
+
+        # 裸港股代码（无 HK 前缀）：A股/ETF/BSE 均为 6 位，故 4-5 位纯数字
+        # 只可能是港股。历史上此处会兜底成 .SZ，导致如 02513 被误判为 02513.SZ
+        # 而在 Yahoo 上 404，港股日线彻底取不到。
+        if code.isdigit() and 4 <= len(code) <= 5:
+            hk_code = self._to_hk_yahoo_symbol(code)
+            logger.debug(f"识别为裸港股代码: {stock_code} -> {hk_code}")
+            return hk_code
+
+        logger.warning(f"无法确定股票 {code} 的市场，默认使用深市")
+        return f"{code}.SZ"
 
     @retry(
         stop=stop_after_attempt(3),
