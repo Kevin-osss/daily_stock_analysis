@@ -1,0 +1,89 @@
+# syntax=docker/dockerfile:1.7
+
+# ==========================================================
+# DSA 后端 API 镜像（不含 Web 前端）
+# ==========================================================
+# 与 docker/Dockerfile 的区别：去掉 node web-builder 阶段，不产出 static/。
+# 用于只消费 API 的客户端（移动端 App）：
+#   - 构建更快、更省内存（低配 VPS 上 vite 构建是主要瓶颈）
+#   - 没有 static/index.html，api/app.py 的 has_frontend 探测为 false，
+#     SPA 与 /assets/* 路由自动不挂载，攻击面只剩 /api/v1/*
+#   - 仍然内置 stocks.index.json（客户端搜索索引数据源），
+#     它由 /stocks.index.json 路由提供，与前端挂载无关
+#
+# 构建：docker build -f docker/Dockerfile.server -t dsa-server .
+# 需要 Web 界面时改用 docker/Dockerfile。
+
+# Pin to bookworm: wkhtmltopdf was removed from Debian testing (2025)
+FROM python:3.11-slim-bookworm
+
+WORKDIR /app
+
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# 系统依赖（wkhtmltopdf 含 wkhtmltoimage，用于 Markdown 转图片推送）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    curl \
+    git \
+    gosu \
+    wkhtmltopdf \
+    fontconfig \
+    libjpeg62-turbo \
+    libxrender1 \
+    libxext6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 非 root 用户 (UID 1000)
+RUN groupadd -g 1000 dsa && \
+    useradd -u 1000 -g dsa -m dsa
+
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
+
+# 应用代码
+COPY *.py ./
+COPY api/ ./api/
+COPY data_provider/ ./data_provider/
+COPY bot/ ./bot/
+COPY src/ ./src/
+COPY strategies/ ./strategies/
+# 只取搜索索引这一个文件，不要整个前端；对应 api/app.py 的
+# _bundled_stock_index_path() 回退路径，离线也能提供搜索数据。
+COPY apps/dsa-web/public/stocks.index.json ./apps/dsa-web/public/
+COPY docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+# Verify globally bundled runtime dependencies without leaving SDK logs in the image.
+RUN mkdir -p /tmp/futu-sdk-smoke-home && \
+    HOME=/tmp/futu-sdk-smoke-home python -c "import alphasift.dsa_adapter; import futu" && \
+    rm -rf /tmp/futu-sdk-smoke-home
+
+RUN mkdir -p /app/data /app/logs /app/reports && \
+    chown -R dsa:dsa /app && \
+    chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# efinance 将搜索缓存写入自身安装包内的 data 目录（默认 root 属主），
+# 非 root 运行时会 PermissionError 导致 A 股数据源降级。预置属主修复。
+RUN EF_DATA_DIR="$(python -c 'import efinance, pathlib; print(pathlib.Path(efinance.__file__).parent / "data")')" && \
+    mkdir -p "$EF_DATA_DIR" && \
+    chown -R dsa:dsa "$EF_DATA_DIR"
+
+ENV PYTHONUNBUFFERED=1
+ENV LOG_DIR=/app/logs
+ENV DATABASE_PATH=/app/data/stock_analysis.db
+ENV WEBUI_HOST=0.0.0.0
+ENV API_PORT=8000
+
+EXPOSE 8000
+
+VOLUME ["/app/data", "/app/logs", "/app/reports"]
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8000/api/health || curl -f http://localhost:8000/health \
+    || python -c "import sys; sys.exit(0)"
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
+# 纯 API 服务（不跑定时分析任务）
+CMD ["python", "main.py", "--serve-only", "--host", "0.0.0.0", "--port", "8000"]

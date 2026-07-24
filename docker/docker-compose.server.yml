@@ -1,0 +1,54 @@
+# ==========================================================
+# DSA 后端 API — 单机低配部署（移动端消费）
+# ==========================================================
+# 用法：
+#   docker compose -f docker/docker-compose.server.yml up -d --build
+#
+# 面向 1 vCPU / 2GB 的小型 VPS：只跑 API 服务，不跑 analyzer 定时任务，
+# MAX_WORKERS=1 避免单核上多个分析任务互相抢占。
+# 端口只绑定 127.0.0.1，由宿主机 Nginx 反代并终止 TLS。
+
+name: dsa-server
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    container_name: dsa-server
+    restart: unless-stopped
+
+    env_file:
+      - ../.env
+
+    volumes:
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ../reports:/app/reports
+      - ../strategies:/app/strategies:ro
+
+    environment:
+      - TZ=Asia/Shanghai
+      - WEBUI_HOST=0.0.0.0
+      # 单核：串行执行分析任务，避免抢占导致整体变慢
+      - MAX_WORKERS=1
+      # 反代在前，取 X-Forwarded-For 最右侧地址做限流分桶
+      - TRUST_X_FORWARDED_FOR=true
+
+    # 只对本机暴露；公网访问走 Nginx。
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # 2GB 机器：留出约 512MB 给宿主机与 Nginx。
+    deploy:
+      resources:
+        limits:
+          memory: 1400M
+        reservations:
+          memory: 512M
